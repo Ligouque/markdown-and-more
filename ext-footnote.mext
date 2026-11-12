@@ -1,0 +1,165 @@
+/* =========================================================
+ * 脚注扩展  (ext-footnote.mext)
+ * ---------------------------------------------------------
+ * 给 A Boat 带来标准 Markdown 脚注语法：
+ *
+ *   正文里写引用：复杂度证明见[^证明]，
+ *   也可以用数字[^1]。普通文字 arr[^2] 不受影响。
+ *
+ *   文末（或任意段落位置）写定义：
+ *   [^证明]: 用势能分析法，均摊 O(1)。
+ *   [^1]: 定义支持**加粗**、`代码`、$公式$等行内语法。
+ *   [^2]: 缺少对应的定义时，引用保持原样，不会误替换。
+ *
+ * 行为要点：
+ *   · 引用编号按正文中首次出现的顺序自动排列，
+ *     与定义的书写顺序无关；同一个标签多次引用共享编号
+ *   · 只有存在对应定义的引用才会被替换——
+ *     数组下标 arr[^1]、代码块里的示例都不会被误伤
+ *   · 定义段落会被从正文中移除，统一收入文末脚注区；
+ *     没有被引用的定义也会列在最后
+ *   · 悬停引用可预览脚注内容；点引用跳到脚注，点 ↩ 跳回
+ *   · 标签支持数字、英文、中文（如 [^术语]）
+ *   · 采用 postTransform 实现，内容先经行内语法渲染，
+ *     与代码高亮 / 表情等扩展的 postTransform 互不干扰
+ *   · 明暗主题自动适配；导出 HTML 带样式（变量有回退色）
+ *
+ * 工具栏会出现 ¹ 按钮：一键插入下一个编号的脚注引用，
+ * 并自动在文末补上空的定义，光标停在定义处等您输入。
+ * ========================================================= */
+api.register({
+  name: '脚注',
+  version: '1.0.0',
+  author: 'LSC',
+  description: '标准脚注语法 [^标签] + [^标签]: 定义，自动编号、悬停预览、点击互跳。',
+  icon: '¹',
+
+  init: function (ctx) {
+
+    /* ---------------- 样式 ---------------- */
+    var STYLE_ID = 'fn-ext-style';
+    var CSS = [
+      '.fn-section{margin:2.3em 0 .8em;padding-top:1.15em;border-top:1px solid var(--line,#e0ddd7)}',
+      '.fn-section .fn-cap{font-size:.82em;color:var(--muted,#8d8880);margin:0 0 .5em;font-weight:600}',
+      '.fn-section ol.fn-list{margin:0;padding-left:1.55em;font-size:.88em;color:var(--text-soft,#4a453f);line-height:1.7}',
+      '.fn-section ol.fn-list li{margin:.32em 0;padding-left:.25em}',
+      '.fn-section ol.fn-list li:target{background:var(--accent-soft,#fdf1e9);border-radius:4px}',
+      '.fn-section .fn-back{margin-left:.5em;font-size:.82em;color:var(--muted,#8d8880);text-decoration:none}',
+      '.fn-section .fn-back:hover{color:var(--accent,#c2410c)}',
+      'sup.fn-ref{font-size:.72em;line-height:0;vertical-align:super;margin:0 .05em}',
+      'sup.fn-ref a.fn-a{color:var(--accent,#c2410c);text-decoration:none;font-weight:600;border-bottom:1px dotted var(--accent,#c2410c);padding:0 .06em}',
+      'sup.fn-ref a.fn-a:hover{border-bottom-style:solid}'
+    ].join('\n');
+
+    function ensureStyle() {
+      if (document.getElementById(STYLE_ID)) return;
+      var s = document.createElement('style');
+      s.id = STYLE_ID;
+      s.textContent = CSS;
+      document.head.appendChild(s);
+    }
+    ensureStyle();
+
+    /* ---------------- 工具 ---------------- */
+    function esc(s) {
+      return String(s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+    function plain(html) {          // 取定义的纯文本做悬停预览
+      return String(html).replace(/<[^>]*>/g, '');
+    }
+
+    /* ---------------- 渲染 ---------------- */
+    // 定义段落：行内语法已渲染后形如 <p>[^标签]: 内容</p>
+    var RE_DEF  = /<p>\[\^([^\s^\]]+)\]:[ \t]*([\s\S]*?)<\/p>/g;
+    // 引用扫描：先跳过代码区域，再匹配 [^标签]（沿用 emoji 扩展的保护手法）
+    var RE_SCAN = /(<pre[\s\S]*?<\/pre>|<code[\s\S]*?<\/code>)|\[\^([^\s^\]]+)\]/g;
+
+    ctx.md.postTransform(function (html) {
+      var defs = {};        // 标签 -> 内容 HTML
+      var defOrder = [];    // 定义的文档顺序（未被引用的补在末尾）
+
+      // 1. 摘出定义段落（正文里不再出现）
+      html = html.replace(RE_DEF, function (m, label, content) {
+        if (defs[label] == null) {
+          defs[label] = content;
+          defOrder.push(label);
+        }
+        return '';          // 从正文移除
+      });
+
+      if (!defOrder.length) return html;   // 没有任何定义：保持原样，arr[^1] 不受影响
+
+      var num = 0;
+      var refId = {};       // 标签 -> 编号
+      var firstRefId = {};  // 标签 -> 首个引用的锚点 id
+
+      // 2. 替换正文引用（跳过 <pre>/<code>）
+      html = html.replace(RE_SCAN, function (m, code, label) {
+        if (code) return code;
+        if (defs[label] == null) return m;   // 无定义的引用保持原样
+        if (refId[label] == null) {
+          refId[label] = ++num;
+          firstRefId[label] = 'fnref-' + refId[label];
+        }
+        var n = refId[label];
+        var tip = esc(plain(defs[label])).slice(0, 120);
+        return '<sup class="fn-ref" id="' + firstRefId[label] + '">' +
+               '<a class="fn-a" href="#fn-' + n + '" title="' + tip + '">' + n + '</a></sup>';
+      });
+
+      // 3. 生成脚注区：按首次引用顺序排列，再补上未被引用的定义
+      var items = [];
+      var all = [];
+      for (var k = 1; k <= num; k++) {
+        for (var lb in refId) if (refId[lb] === k) { all.push(lb); break; }
+      }
+      defOrder.forEach(function (lb) {
+        if (refId[lb] == null) all.push(lb);
+      });
+
+      all.forEach(function (lb) {
+        var n = refId[lb] || (++num);
+        var back = firstRefId[lb]
+          ? '<a class="fn-back" href="#' + firstRefId[lb] + '">&#8617;</a>'
+          : '';                                // 未被引用的定义没有回链
+        items.push('<li id="fn-' + n + '"><span class="fn-text">' + defs[lb] + '</span>' + back + '</li>');
+      });
+      if (!items.length) return html;
+
+      return html +
+        '<section class="fn-section"><div class="fn-cap">脚注</div>' +
+        '<ol class="fn-list">' + items.join('') + '</ol></section>';
+    });
+
+    /* ---------------- 工具栏按钮：插入下一号脚注 ---------------- */
+    ctx.ui.addButton({
+      id: 'footnote',
+      icon: '¹',
+      title: '插入脚注（自动编号，定义补在文末）',
+      onClick: function (h) {
+        var ed = h.editor;
+        var v = ed.value;
+        var s = ed.selectionStart, e = ed.selectionEnd;
+        var re = /\[\^(\d+)\]/g, m, max = 0;
+        while ((m = re.exec(v))) {
+          var k = parseInt(m[1], 10);
+          if (k > max) max = k;
+        }
+        var n = max + 1;
+        var body = (v.slice(0, s) + '[^' + n + ']' + v.slice(e)).replace(/\s+$/, '');
+        body += '\n\n[^' + n + ']: ';
+        h.setValue(body);
+        ed.focus();
+        ed.setSelectionRange(body.length, body.length);
+      }
+    });
+  },
+
+  /* 扩展被停用 / 移除时清理注入的样式 */
+  dispose: function () {
+    var s = document.getElementById('fn-ext-style');
+    if (s && s.parentNode) s.parentNode.removeChild(s);
+  }
+});

@@ -1,0 +1,166 @@
+/* =========================================================
+ * 时间轴扩展  (ext-timeline.mext)
+ * ---------------------------------------------------------
+ * 用 :::timeline 写时间轴 / 大事记 / 更新日志：
+ *
+ *   :::timeline 项目大事记
+ *   2026-11-07 :: 上传基本代码与六个扩展
+ *   2026-11-08 (ok) :: 增加图表扩展
+ *   2026-11-09 (warn) :: README 结构调整
+ *   也可以写没有日期的普通节点
+ *   :::
+ *
+ * 要点：
+ *   · 标题可省略（:::timeline 后不写即可）
+ *   · 每条记录一行：「日期 :: 内容」；分隔符也认全角 ：：
+ *   · 日期后可加类型标记 (ok|warn|bad|info)，圆点与日期跟着变色
+ *   · 没有 :: 的行视为无日期节点；缩进 2 空格的行接续上一条
+ *   · 内容支持行内 Markdown（加粗、行内代码、公式等）
+ *   · 内部空行会被忽略；遇到其他容器（如 :::tip）时时间轴自动结束，
+ *     不会吞掉容器内容；扫到文末没有收尾则视作文末闭合
+ *   · 采用 preTransform 实现，先于一切块级规则运行，
+ *     与容器块 / 语法高亮等扩展无论装载顺序如何都不冲突
+ *   · 明暗主题自动适配；导出 HTML 带样式（变量均有回退色）
+ * ========================================================= */
+api.register({
+  name: '时间轴',
+  version: '1.0.0',
+  author: 'LSC',
+  description: '用 :::timeline 标题 / 日期 :: 内容 ::: 写时间轴，支持 ok / warn / bad / info 节点变色。',
+  icon: '🕘',
+
+  init: function (ctx) {
+
+    /* ---------------- 样式 ---------------- */
+    var STYLE_ID = 'tl-ext-style';
+    var CSS = [
+      '.tl-box{margin:1.45em 0;padding:.2em 0 .3em 1.6em;position:relative}',
+      '.tl-box::before{content:"";position:absolute;left:.32em;top:.85em;bottom:.6em;width:2px;border-radius:2px;background:var(--line-strong,#d8d3c8)}',
+      '.tl-box .tl-title{font-weight:700;color:var(--text,#221f1b);margin:0 0 .75em}',
+      '.tl-box .tl-item{position:relative;display:grid;grid-template-columns:minmax(0,7.5em) minmax(0,1fr);column-gap:.95em;margin:0 0 1.05em}',
+      '.tl-box .tl-item:last-child{margin-bottom:0}',
+      '.tl-box .tl-item::before{content:"";position:absolute;left:calc(-1.6em + .32em - .36em + 1px);top:.34em;width:.72em;height:.72em;border-radius:50%;background:var(--accent,#c2410c);box-shadow:0 0 0 3px var(--bg,#fff)}',
+      '.tl-box .tl-date{color:var(--muted,#8d8880);font-size:.88em;font-weight:600;padding-top:.12em;font-variant-numeric:tabular-nums;word-break:break-word}',
+      '.tl-box .tl-body{margin:0;color:var(--text-soft,#4a453f);line-height:1.65;min-width:0}',
+      '.tl-box .tl-item.tl-ok::before{background:#22c55e}',
+      '.tl-box .tl-item.tl-warn::before{background:#f59e0b}',
+      '.tl-box .tl-item.tl-bad::before{background:#ef4444}',
+      '.tl-box .tl-item.tl-info::before{background:#3b82f6}',
+      '.tl-box .tl-item.tl-ok .tl-date{color:#16a34a}',
+      '.tl-box .tl-item.tl-warn .tl-date{color:#d97706}',
+      '.tl-box .tl-item.tl-bad .tl-date{color:#dc2626}',
+      '.tl-box .tl-item.tl-info .tl-date{color:#2563eb}',
+      '@media (max-width:34em){.tl-box .tl-item{grid-template-columns:1fr}.tl-box .tl-date{margin-bottom:.12em}}'
+    ].join('\n');
+
+    function ensureStyle() {
+      if (document.getElementById(STYLE_ID)) return;
+      var s = document.createElement('style');
+      s.id = STYLE_ID;
+      s.textContent = CSS;
+      document.head.appendChild(s);
+    }
+    ensureStyle();
+
+    /* ---------------- 语法解析 ---------------- */
+    var RE_OPEN  = /^\s{0,3}:::timeline[ \t]*(.*)$/;
+    var RE_ANY3  = /^\s{0,3}:::/;              // 任何以 ::: 开头的行（容器边界）
+    var RE_CLOSE = /^\s{0,3}:::\s*$/;           // 纯 ::: 收尾行
+    var RE_FENCE = /^\s{0,3}(`{3,}|~{3,})/;
+    var RE_ITEM  = /^\s{0,3}(.+?)[ \t]*(?:[(（](ok|warn|bad|info)[)）][ \t]*)?(::|：：)[ \t]*(.*)$/;
+
+    function esc(s) {
+      return String(s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function renderTimeline(title, items) {
+      var out = ['<div class="tl-box">'];
+      if (title) out.push('<div class="tl-title">' + ctx.md.inline(title) + '</div>');
+      for (var k = 0; k < items.length; k++) {
+        var it = items[k];
+        out.push('<div class="tl-item' + (it.type ? ' tl-' + it.type : '') + '">');
+        out.push('<div class="tl-date">' + (it.date ? esc(it.date) : '') + '</div>');
+        out.push('<div class="tl-body">' + ctx.md.inline(it.text) + '</div>');
+        out.push('</div>');
+      }
+      out.push('</div>');
+      return out.join('\n');
+    }
+
+    ctx.md.preTransform(function (text) {
+      var lines = String(text).split('\n');
+      var out = [];
+      var i = 0;
+      var fence = null;   // 当前所在围栏代码块的围栏字符（含长度），为 null 表示不在代码块内
+
+      while (i < lines.length) {
+        var line = lines[i];
+
+        // 围栏代码块内的内容一概不动
+        var fm = line.match(RE_FENCE);
+        if (fence) {
+          if (fm && fm[1].charAt(0) === fence.charAt(0) && fm[1].length >= fence.length) fence = null;
+          out.push(line); i++;
+          continue;
+        }
+        if (fm) { fence = fm[1]; out.push(line); i++; continue; }
+
+        var om = line.match(RE_OPEN);
+        if (!om) { out.push(line); i++; continue; }
+
+        // 收集 :::timeline … ::: 的内容
+        var title = (om[1] || '').trim();
+        var items = [];
+        var j = i + 1;
+        var end = -1;        // 结束边界行的下标
+        var while_ended = true;
+        while (j < lines.length) {
+          var l = lines[j];
+          if (RE_CLOSE.test(l)) { end = j; while_ended = false; break; }      // 纯 ::: 收尾（消费该行）
+          if (RE_ANY3.test(l)) { end = j - 1; while_ended = false; break; }   // 撞上其他容器：隐式结束（不吞它的开头）
+          if (/^\s*$/.test(l)) { j++; continue; }                             // 内部空行忽略
+          if (items.length && /^\s{2,}\S/.test(l)) {                          // 缩进续行接上一条
+            items[items.length - 1].text += ' ' + l.trim();
+            j++;
+            continue;
+          }
+          var m = l.match(RE_ITEM);
+          if (m) items.push({ date: m[1].trim(), type: m[2] || '', text: m[4] });
+          else   items.push({ date: '', type: '', text: l.trim() });
+          j++;
+        }
+        if (while_ended) end = j - 1;   // 扫到文末都没有边界：视作在文末闭合
+
+        out.push(renderTimeline(title, items));
+        i = end + 1;
+      }
+      return out.join('\n');
+    });
+
+    /* ---------------- 工具栏按钮 ---------------- */
+    ctx.ui.addButton({
+      id: 'timeline',
+      icon: '🕘',
+      title: '插入时间轴模板',
+      onClick: function (h) {
+        h.insertText(
+          ':::timeline 时间轴标题\n' +
+          '2026-01-01 :: 第一件事（内容支持 **加粗**、`代码`、$公式$）\n' +
+          '2026-01-02 (ok) :: 类型可写 ok / warn / bad / info，圆点跟着变色\n' +
+          '  缩进两格的行会接续到上一条\n' +
+          '没有日期的节点也可以\n' +
+          ':::\n',
+          12
+        );
+      }
+    });
+  },
+
+  /* 扩展被停用 / 移除时清理注入的样式 */
+  dispose: function () {
+    var s = document.getElementById('tl-ext-style');
+    if (s && s.parentNode) s.parentNode.removeChild(s);
+  }
+});
